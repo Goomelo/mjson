@@ -70,6 +70,38 @@ static void test_parse_array() {
     EXPECT_EQ_INT(MJSON_ARRAY, mjson_get_type(&v));
     EXPECT_EQ_SIZE_T(0, mjson_get_array_size(&v));
     mjson_free(&v);
+
+    mjson_init(&v);
+    EXPECT_EQ_INT(MJSON_PARSE_OK, mjson_parse(&v,"[ null , false , true , 123, \"abc\" ]"));
+    EXPECT_EQ_INT(MJSON_ARRAY, mjson_get_type(&v));
+    EXPECT_EQ_SIZE_T(5, mjson_get_array_size(&v));
+    EXPECT_EQ_INT(MJSON_NULL, mjson_get_type(mjson_get_array_element(&v, 0)));
+    EXPECT_EQ_INT(MJSON_FALSE, mjson_get_type(mjson_get_array_element(&v, 1)));
+    EXPECT_EQ_INT(MJSON_TRUE, mjson_get_type(mjson_get_array_element(&v,2)));
+    EXPECT_EQ_INT(MJSON_NUMBER, mjson_get_type(mjson_get_array_element(&v,3)));
+    EXPECT_EQ_INT(MJSON_STRING, mjson_get_type(mjson_get_array_element(&v, 4)));
+    EXPECT_EQ_DOUBLE(123, mjson_get_array_element(&v, 3));
+    EXPECT_EQ_STRING("abc", mjson_get_array_element(&v,4),
+                     mjson_get_string_length(mjson_get_array_element(&v,4)));
+    mjson_free(&v);
+
+    mjson_init(&v);
+    EXPECT_EQ_INT(MJSON_PARSE_OK, mjson_parse(&v,"[ [ ] , [ 0 ] , [ 0 , 1 ] , [ 0 , 1 , 2 ] ]"));
+    EXPECT_EQ_INT(MJSON_ARRAY, mjson_get_type(&v));
+    EXPECT_EQ_SIZE_T(4, mjson_get_array_size(&v));
+    for(int i = 0; i < 4; i++){
+        mjson_value* e = mjson_get_array_element(&v, i);
+        EXPECT_EQ_INT(MJSON_ARRAY, mjson_get_type(e));
+        EXPECT_EQ_SIZE_T(i, mjson_get_array_size(e));
+        for (int j = 0; j < i; j ++){
+            mjson_value* tmp = mjson_get_array_element(&v, j);
+            EXPECT_EQ_INT(MJSON_NUMBER, mjson_get_type(tmp));
+            EXPECT_EQ_INT((double)j, mjson_get_number(tmp));
+        }
+    }
+    mjson_free(&v);
+
+
 }
 
 #define TEST_NUMBER(expect, json)\
@@ -228,6 +260,7 @@ static void test_parse() {
     test_parse_false();
     test_parse_number();
     test_parse_string();
+    test_parse_array();
     test_parse_expect_value();
     test_parse_invalid_value();
     test_parse_root_not_singular();
