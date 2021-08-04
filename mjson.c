@@ -6,6 +6,7 @@
 #include <assert.h>  /* assert() */
 #include <errno.h>   /* errno, ERANGE */
 #include <math.h>    /* HUGE_VAL */
+#include <stdio.h>   /* sprintf() */
 #include <stdlib.h>  /* NULL, malloc(), realloc(), free(), strtod() */
 #include <string.h>  /* memcpy() */
 
@@ -13,19 +14,21 @@
 #define MJSON_PARSE_STACK_INIT_SIZE 256
 #endif
 
+#ifndef MJSON_PARSE_STRINGIFY_INIT_SIZE
+#define MJSON_PARSE_STRINGIFY_INIT_SIZE 256
+#endif
+
 #define EXPECT(c, ch)       do { assert(*c->json == (ch)); c->json++; } while(0)
 #define ISDIGIT(ch)         ((ch) >= '0' && (ch) <= '9')
 #define ISDIGIT1TO9(ch)     ((ch) >= '1' && (ch) <= '9')
 #define PUTC(c, ch)         do { *(char*)mjson_context_push(c, sizeof(char)) = (ch); } while(0)
+#define PUTS(c, s, len)     memcpy(mjson_context_push(c, len), s, len)
 
 typedef struct {
     const char* json;
     char* stack;
     size_t size, top;
 }mjson_context;
-
-
-static int mjson_parse_value(mjson_context* c, mjson_value* v);
 
 static void* mjson_context_push(mjson_context* c, size_t size) {
     void* ret;
@@ -130,8 +133,8 @@ static void mjson_encode_utf8(mjson_context* c, unsigned u) {
 
 #define STRING_ERROR(ret) do { c->top = head; return ret; } while(0)
 
-static int mjson_parse_string(mjson_context* c, mjson_value* v) {
-    size_t head = c->top, len;
+static int mjson_parse_string_raw(mjson_context* c, char** str, size_t* len) {
+    size_t head = c->top;
     unsigned u, u2;
     const char* p;
     EXPECT(c, '\"');
@@ -140,8 +143,8 @@ static int mjson_parse_string(mjson_context* c, mjson_value* v) {
         char ch = *p++;
         switch (ch) {
             case '\"':
-                len = c->top - head;
-                mjson_set_string(v, (const char*)mjson_context_pop(c, len), len);
+                *len = c->top - head;
+                *str = mjson_context_pop(c, *len);
                 c->json = p;
                 return MJSON_PARSE_OK;
             case '\\':
@@ -184,36 +187,129 @@ static int mjson_parse_string(mjson_context* c, mjson_value* v) {
     }
 }
 
-static int mjson_parse_array( mjson_context* c, mjson_value* v) {
-    size_t size = 0;
+static int mjson_parse_string(mjson_context* c, mjson_value* v) {
+    int ret;
+    char* s;
+    size_t len;
+    if ((ret = mjson_parse_string_raw(c, &s, &len)) == MJSON_PARSE_OK)
+        mjson_set_string(v, s, len);
+    return ret;
+}
+
+static int mjson_parse_value(mjson_context* c, mjson_value* v);
+
+static int mjson_parse_array(mjson_context* c, mjson_value* v) {
+    size_t i, size = 0;
     int ret;
     EXPECT(c, '[');
+    mjson_parse_whitespace(c);
     if (*c->json == ']') {
-        c->json ++;
+        c->json++;
         v->type = MJSON_ARRAY;
-        v->u.a.e = NULL;
         v->u.a.size = 0;
+        v->u.a.e = NULL;
         return MJSON_PARSE_OK;
     }
     for (;;) {
         mjson_value e;
         mjson_init(&e);
         if ((ret = mjson_parse_value(c, &e)) != MJSON_PARSE_OK)
-            return ret;
+            break;
         memcpy(mjson_context_push(c, sizeof(mjson_value)), &e, sizeof(mjson_value));
         size++;
-        if (*c->json == ','){
+        mjson_parse_whitespace(c);
+        if (*c->json == ',') {
             c->json++;
-        } else if( *c->json == ']') {
-            c->json ++;
+            mjson_parse_whitespace(c);
+        }
+        else if (*c->json == ']') {
+            c->json++;
             v->type = MJSON_ARRAY;
             v->u.a.size = size;
             size *= sizeof(mjson_value);
-            memcpy(v->u.a.e = (mjson_value*) malloc(size), mjson_context_pop(c, size),size);
+            memcpy(v->u.a.e = (mjson_value*)malloc(size), mjson_context_pop(c, size), size);
             return MJSON_PARSE_OK;
         }
-        else return MJSON_PARSE_MISS_COMMA_OR_SQUARE_BRACKET;
+        else {
+            ret = MJSON_PARSE_MISS_COMMA_OR_SQUARE_BRACKET;
+            break;
+        }
     }
+    /* Pop and free values on the stack */
+    for (i = 0; i < size; i++)
+        mjson_free((mjson_value*)mjson_context_pop(c, sizeof(mjson_value)));
+    return ret;
+}
+
+static int mjson_parse_object(mjson_context* c, mjson_value* v) {
+    size_t i, size;
+    mjson_member m;
+    int ret;
+    EXPECT(c, '{');
+    mjson_parse_whitespace(c);
+    if (*c->json == '}') {
+        c->json++;
+        v->type = MJSON_OBJECT;
+        v->u.o.m = 0;
+        v->u.o.size = 0;
+        return MJSON_PARSE_OK;
+    }
+    m.k = NULL;
+    size = 0;
+    for (;;) {
+        char* str;
+        mjson_init(&m.v);
+        /* parse key */
+        if (*c->json != '"') {
+            ret = MJSON_PARSE_MISS_KEY;
+            break;
+        }
+        if ((ret = mjson_parse_string_raw(c, &str, &m.klen)) != MJSON_PARSE_OK)
+            break;
+        memcpy(m.k = (char*)malloc(m.klen + 1), str, m.klen);
+        m.k[m.klen] = '\0';
+        /* parse ws colon ws */
+        mjson_parse_whitespace(c);
+        if (*c->json != ':') {
+            ret = MJSON_PARSE_MISS_COLON;
+            break;
+        }
+        c->json++;
+        mjson_parse_whitespace(c);
+        /* parse value */
+        if ((ret = mjson_parse_value(c, &m.v)) != MJSON_PARSE_OK)
+            break;
+        memcpy(mjson_context_push(c, sizeof(mjson_member)), &m, sizeof(mjson_member));
+        size++;
+        m.k = NULL; /* ownership is transferred to member on stack */
+        /* parse ws [comma | right-curly-brace] ws */
+        mjson_parse_whitespace(c);
+        if (*c->json == ',') {
+            c->json++;
+            mjson_parse_whitespace(c);
+        }
+        else if (*c->json == '}') {
+            size_t s = sizeof(mjson_member) * size;
+            c->json++;
+            v->type = MJSON_OBJECT;
+            v->u.o.size = size;
+            memcpy(v->u.o.m = (mjson_member*)malloc(s), mjson_context_pop(c, s), s);
+            return MJSON_PARSE_OK;
+        }
+        else {
+            ret = MJSON_PARSE_MISS_COMMA_OR_CURLY_BRACKET;
+            break;
+        }
+    }
+    /* Pop and free members on the stack */
+    free(m.k);
+    for (i = 0; i < size; i++) {
+        mjson_member* m = (mjson_member*)mjson_context_pop(c, sizeof(mjson_member));
+        free(m->k);
+        mjson_free(&m->v);
+    }
+    v->type = MJSON_NULL;
+    return ret;
 }
 
 static int mjson_parse_value(mjson_context* c, mjson_value* v) {
@@ -224,6 +320,7 @@ static int mjson_parse_value(mjson_context* c, mjson_value* v) {
         default:   return mjson_parse_number(c, v);
         case '"':  return mjson_parse_string(c, v);
         case '[':  return mjson_parse_array(c, v);
+        case '{':  return mjson_parse_object(c, v);
         case '\0': return MJSON_PARSE_EXPECT_VALUE;
     }
 }
@@ -249,10 +346,132 @@ int mjson_parse(mjson_value* v, const char* json) {
     return ret;
 }
 
-void mjson_free(mjson_value* v) {
+#if 0
+// Unoptimized
+static void mjson_stringify_string(mjson_context* c, const char* s, size_t len) {
+    size_t i;
+    assert(s != NULL);
+    PUTC(c, '"');
+    for (i = 0; i < len; i++) {
+        unsigned char ch = (unsigned char)s[i];
+        switch (ch) {
+            case '\"': PUTS(c, "\\\"", 2); break;
+            case '\\': PUTS(c, "\\\\", 2); break;
+            case '\b': PUTS(c, "\\b",  2); break;
+            case '\f': PUTS(c, "\\f",  2); break;
+            case '\n': PUTS(c, "\\n",  2); break;
+            case '\r': PUTS(c, "\\r",  2); break;
+            case '\t': PUTS(c, "\\t",  2); break;
+            default:
+                if (ch < 0x20) {
+                    char buffer[7];
+                    sprintf(buffer, "\\u%04X", ch);
+                    PUTS(c, buffer, 6);
+                }
+                else
+                    PUTC(c, s[i]);
+        }
+    }
+    PUTC(c, '"');
+}
+#else
+static void mjson_stringify_string(mjson_context* c, const char* s, size_t len) {
+    static const char hex_digits[] = { '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'A', 'B', 'C', 'D', 'E', 'F' };
+    size_t i, size;
+    char* head, *p;
+    assert(s != NULL);
+    p = head = mjson_context_push(c, size = len * 6 + 2); /* "\u00xx..." */
+    *p++ = '"';
+    for (i = 0; i < len; i++) {
+        unsigned char ch = (unsigned char)s[i];
+        switch (ch) {
+            case '\"': *p++ = '\\'; *p++ = '\"'; break;
+            case '\\': *p++ = '\\'; *p++ = '\\'; break;
+            case '\b': *p++ = '\\'; *p++ = 'b';  break;
+            case '\f': *p++ = '\\'; *p++ = 'f';  break;
+            case '\n': *p++ = '\\'; *p++ = 'n';  break;
+            case '\r': *p++ = '\\'; *p++ = 'r';  break;
+            case '\t': *p++ = '\\'; *p++ = 't';  break;
+            default:
+                if (ch < 0x20) {
+                    *p++ = '\\'; *p++ = 'u'; *p++ = '0'; *p++ = '0';
+                    *p++ = hex_digits[ch >> 4];
+                    *p++ = hex_digits[ch & 15];
+                }
+                else
+                    *p++ = s[i];
+        }
+    }
+    *p++ = '"';
+    c->top -= size - (p - head);
+}
+#endif
+
+static void mjson_stringify_value(mjson_context* c, const mjson_value* v) {
+    size_t i;
+    switch (v->type) {
+        case MJSON_NULL:   PUTS(c, "null",  4); break;
+        case MJSON_FALSE:  PUTS(c, "false", 5); break;
+        case MJSON_TRUE:   PUTS(c, "true",  4); break;
+        case MJSON_NUMBER: c->top -= 32 - sprintf(mjson_context_push(c, 32), "%.17g", v->u.n); break;
+        case MJSON_STRING: mjson_stringify_string(c, v->u.s.s, v->u.s.len); break;
+        case MJSON_ARRAY:
+            PUTC(c, '[');
+            for (i = 0; i < v->u.a.size; i++) {
+                if (i > 0)
+                    PUTC(c, ',');
+                mjson_stringify_value(c, &v->u.a.e[i]);
+            }
+            PUTC(c, ']');
+            break;
+        case MJSON_OBJECT:
+            PUTC(c, '{');
+            for (i = 0; i < v->u.o.size; i++) {
+                if (i > 0)
+                    PUTC(c, ',');
+                mjson_stringify_string(c, v->u.o.m[i].k, v->u.o.m[i].klen);
+                PUTC(c, ':');
+                mjson_stringify_value(c, &v->u.o.m[i].v);
+            }
+            PUTC(c, '}');
+            break;
+        default: assert(0 && "invalid type");
+    }
+}
+
+char* mjson_stringify(const mjson_value* v, size_t* length) {
+    mjson_context c;
     assert(v != NULL);
-    if (v->type == MJSON_STRING)
-        free(v->u.s.s);
+    c.stack = (char*)malloc(c.size = MJSON_PARSE_STRINGIFY_INIT_SIZE);
+    c.top = 0;
+    mjson_stringify_value(&c, v);
+    if (length)
+        *length = c.top;
+    PUTC(&c, '\0');
+    return c.stack;
+}
+
+void mjson_free(mjson_value* v) {
+    size_t i;
+    assert(v != NULL);
+    switch (v->type) {
+        case MJSON_STRING:
+            free(v->u.s.s);
+            break;
+        case MJSON_ARRAY:
+            for (i = 0; i < v->u.a.size; i++)
+                mjson_free(&v->u.a.e[i]);
+            free(v->u.a.e);
+            break;
+        case MJSON_OBJECT:
+            for (i = 0; i < v->u.o.size; i++) {
+                free(v->u.o.m[i].k);
+                mjson_free(&v->u.o.m[i].v);
+            }
+            free(v->u.o.m);
+            break;
+        default: break;
+    }
     v->type = MJSON_NULL;
 }
 
@@ -292,17 +511,6 @@ size_t mjson_get_string_length(const mjson_value* v) {
     return v->u.s.len;
 }
 
-size_t mjson_get_array_size(const mjson_value* v) {
-    assert( v!= NULL && v->type == MJSON_ARRAY);
-    return v->u.a.size;
-}
-
-mjson_value* mjson_get_array_element(const mjson_value* v, size_t index) {
-    assert(v != NULL && v->type == MJSON_ARRAY);
-    assert(index <= v->u.a.size);
-    return &v->u.a.e[index];
-}
-
 void mjson_set_string(mjson_value* v, const char* s, size_t len) {
     assert(v != NULL && (s != NULL || len == 0));
     mjson_free(v);
@@ -311,4 +519,38 @@ void mjson_set_string(mjson_value* v, const char* s, size_t len) {
     v->u.s.s[len] = '\0';
     v->u.s.len = len;
     v->type = MJSON_STRING;
+}
+
+size_t mjson_get_array_size(const mjson_value* v) {
+    assert(v != NULL && v->type == MJSON_ARRAY);
+    return v->u.a.size;
+}
+
+mjson_value* mjson_get_array_element(const mjson_value* v, size_t index) {
+    assert(v != NULL && v->type == MJSON_ARRAY);
+    assert(index < v->u.a.size);
+    return &v->u.a.e[index];
+}
+
+size_t mjson_get_object_size(const mjson_value* v) {
+    assert(v != NULL && v->type == MJSON_OBJECT);
+    return v->u.o.size;
+}
+
+const char* mjson_get_object_key(const mjson_value* v, size_t index) {
+    assert(v != NULL && v->type == MJSON_OBJECT);
+    assert(index < v->u.o.size);
+    return v->u.o.m[index].k;
+}
+
+size_t mjson_get_object_key_length(const mjson_value* v, size_t index) {
+    assert(v != NULL && v->type == MJSON_OBJECT);
+    assert(index < v->u.o.size);
+    return v->u.o.m[index].klen;
+}
+
+mjson_value* mjson_get_object_value(const mjson_value* v, size_t index) {
+    assert(v != NULL && v->type == MJSON_OBJECT);
+    assert(index < v->u.o.size);
+    return &v->u.o.m[index].v;
 }
